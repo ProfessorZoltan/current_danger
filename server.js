@@ -16,7 +16,9 @@
 
   SOURCING (honest about what each field is)
   - Rip risk LEVEL  -> NWS Surf Zone Forecast text, zone NCZ199 (forecast)
-  - Rip PROBABILITY -> NOAA model (GRIB2) — not wired; returns null. See stub.
+  - Rip PROBABILITY -> NWPS model field 10.1.4 (RIPCOP, %) decoded from GRIB2
+                       in pure Node by ./rip-model. Null when no recent on-demand
+                       run is published; dashboard then shows just the SRF level.
   - Surf / period / water temp -> NDBC Waverider buoy (live observation)
   - Wind -> Surf Zone Forecast text (forecast; Waverider buoys have no wind)
   - Tide series -> CO-OPS predictions, station 8657167 New River Inlet
@@ -26,10 +28,11 @@ const http = require("http");
 const fs = require("fs");
 const nodePath = require("path");
 
-// Optional GRIB2 rip-current module. Absent module or missing wgrib2 -> null,
-// and the dashboard falls back to the categorical SRF risk. Never fatal.
+// GRIB2 rip-current module (pure Node, no external deps). A missing module or
+// no recent NWPS run -> null, and the dashboard falls back to the categorical
+// SRF risk. Never fatal.
 let ripModel = null;
-try { ripModel = require("./rip-model"); } catch (_) { /* not installed */ }
+try { ripModel = require("./rip-model"); } catch (_) { /* module absent */ }
 
 const CONFIG = {
   host: "0.0.0.0",
@@ -179,9 +182,9 @@ async function fetchCamStatus() {
 }
 
 async function fetchRipModelProb() {
-  // Delegated to ./rip-model (NWPS GRIB2 via wgrib2). Returns 0-100 or null.
-  // Null is expected unless MHX publishes the experimental rip field AND
-  // wgrib2 is installed — in which case the dashboard shows category only.
+  // Delegated to ./rip-model (NWPS GRIB2, decoded in pure Node). Returns 0-100
+  // or null. Null when MHX has no recent on-demand run; the dashboard then
+  // shows the categorical SRF risk only.
   if (!ripModel) return null;
   return await ripModel.getRipProbability({ when: new Date() });
 }
