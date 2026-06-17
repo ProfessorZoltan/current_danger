@@ -296,6 +296,7 @@
     drawTide(data.tide.series, now);
     var ext = nextExtreme(data.tide.series.map(function(p){return {t:new Date(p.t).getTime(),h:p.h};}), now.getTime());
     document.getElementById("tide-caption").textContent =
+      (data.tide.station ? data.tide.station + " \u00B7 " : "") +
       "Datum " + (data.tide.datum||"MLLW") + (ext ? (" \u00B7 next " + ext.kind + " around " + fmtTime(new Date(ext.t))) : "");
   }
 

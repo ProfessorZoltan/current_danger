@@ -46,7 +46,11 @@ const CONFIG = {
   },
   buoyIds: ["41109", "41159", "41037"],   // New River Inlet -> Onslow Bay -> Wrightsville
   buoyStaleMinutes: 120,
-  tideStation: "8657167",                 // New River Inlet, NC (predictions only)
+  // New River Inlet (8657167) is a water-level station with NO harmonic tide
+  // predictions, so datagetter returns a datum error. Use the nearest harmonic
+  // ocean station that does support predictions, as a labeled proxy.
+  tideStation: "8658163",                 // Wrightsville Beach, NC (~30 mi SW)
+  tideStationName: "Wrightsville Beach (proxy)",
   cam: {
     check: true,
     m3u8: "https://www.surfchex.com/hls/svfp/index.m3u8"
@@ -168,7 +172,7 @@ async function fetchTides() {
     t: p.t.replace(" ", "T") + ":00",   // local naive ISO; browser parses as local (ET users)
     h: Math.round(parseFloat(p.v) * 100) / 100
   }));
-  return { datum: "MLLW", series };
+  return { datum: "MLLW", station: CONFIG.tideStationName, series };
 }
 
 async function fetchCamStatus() {
@@ -251,7 +255,7 @@ async function refresh() {
       wind: (srf && srf.wind) || "—",
       water: (buoy && buoy.water) || "—"
     },
-    tide: tide || { datum: "MLLW", series: [] },
+    tide: tide || { datum: "MLLW", station: CONFIG.tideStationName, series: [] },
     sources
   };
 
