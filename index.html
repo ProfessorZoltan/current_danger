@@ -1,0 +1,418 @@
+<!doctype html>
+<!--
+  Seaview Pier / New River Inlet — current-safety dashboard
+  =========================================================
+  Single-file front end. Host it anywhere static.
+
+  WHAT'S REAL vs WIRED
+  - Live cam: real HLS stream (Safari plays natively; others via hls.js).
+    Cross-origin playback depends on SurfChex's CORS headers / your having
+    permission — if it can't play, the panel falls back to a link out.
+  - Inlet tidal-current level: computed live in JS from the tide curve +
+    the current time. This is real logic, clearly labeled as inferred from
+    tide stage (not a measured current).
+  - Rip risk, surf, wind, water temp: come from your data source. There is
+    no clean browser-fetchable public API for the NOAA rip-current model,
+    and NDBC buoy files don't send CORS headers — so a small backend has to
+    aggregate those server-side. Until CONFIG.dataEndpoint is set, the page
+    runs on built-in SAMPLE data and says so loudly.
+
+  BACKEND CONTRACT (CONFIG.dataEndpoint should return this JSON):
+  {
+    "updated": "2026-06-17T13:48:00-04:00",
+    "rip":   { "level": "Moderate", "prob": 45 },           // from NWS SRF + NOAA model
+    "conditions": { "surf": "3-4 ft", "period": "8 s", "wind": "SW 12", "water": "78F" },
+    "tide": { "datum": "MLLW",
+              "series": [ { "t": "2026-06-17T06:00:00-04:00", "h": 2.6 }, ... ] },
+    "sources": [ { "name": "Rip risk - NWS SRF", "status": "ok", "detail": "4:00 AM" }, ... ]
+  }
+  status is one of: "ok" | "warn" | "down".
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Seaview Pier — current safety</title>
+<style>
+  :root{
+    --bg:#f6f8f9; --surface:#ffffff; --ink:#19242a; --muted:#5d6b73;
+    --border:#e4e9ec; --line:#2b86c4;
+    --amber-bg:#fdf1da; --amber-ink:#7c4f08; --amber-edge:#c98213;
+    --red-bg:#fbe8e6; --red-ink:#8c2c26; --red-edge:#d8453c;
+    --green-bg:#e9f3de; --green-ink:#3a6710; --green-edge:#5f8f24;
+    --ok:#3a6710; --warn:#9a6a06; --down:#8c2c26;
+    --radius:14px; --shadow:0 1px 2px rgba(20,30,35,.05);
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.5; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:680px; margin:0 auto; padding:20px 16px 40px}
+  a{color:#1f6f9c}
+  h1{font-size:20px; font-weight:600; margin:0; letter-spacing:-.01em}
+  .sub{font-size:13px; color:var(--muted); margin:2px 0 0}
+  .top{display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:16px}
+  .stamp{display:inline-flex; align-items:center; gap:6px; background:var(--surface); border:1px solid var(--border);
+    border-radius:9px; padding:7px 11px; font-size:12px; color:var(--muted)}
+  .stamp button{all:unset; cursor:pointer; color:#1f6f9c; font-size:12px}
+  .stamp button:focus-visible{outline:2px solid #1f6f9c; outline-offset:2px; border-radius:4px}
+
+  .banner{display:none; align-items:center; gap:8px; background:#fff7e6; border:1px solid #f0d999;
+    color:#7c5807; border-radius:10px; padding:9px 12px; font-size:13px; margin-bottom:16px}
+  .banner.show{display:flex}
+
+  .card{background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow)}
+  .section-label{font-size:13px; font-weight:600; color:var(--muted); margin:0 0 8px; letter-spacing:.02em}
+
+  /* cam */
+  .frame{position:relative; width:100%; aspect-ratio:16/9; background:#0c1114; border-radius:var(--radius);
+    overflow:hidden; border:1px solid var(--border)}
+  .frame video{width:100%; height:100%; object-fit:cover; display:block}
+  .pill{position:absolute; top:10px; left:11px; display:none; align-items:center; gap:6px;
+    background:rgba(0,0,0,.55); color:#fff; font-size:12px; padding:4px 9px; border-radius:7px}
+  .pill .dot{width:7px; height:7px; border-radius:50%; background:#e2504a}
+  .pill.is-live{display:inline-flex}
+  .loading{position:absolute; inset:0; display:flex; align-items:center; justify-content:center}
+  .loading.hide{display:none}
+  .spin{width:26px; height:26px; border:2px solid rgba(255,255,255,.25); border-top-color:#fff;
+    border-radius:50%; animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .fallback{position:absolute; inset:0; display:none; flex-direction:column; align-items:center;
+    justify-content:center; gap:12px; text-align:center; padding:22px}
+  .fallback.show{display:flex}
+  .fallback p{margin:0; color:#a9b6bd; font-size:14px; max-width:34ch}
+  .btn{display:inline-flex; align-items:center; gap:7px; border:1px solid rgba(255,255,255,.2);
+    background:rgba(255,255,255,.06); color:#fff; text-decoration:none; font-size:14px; padding:9px 15px; border-radius:9px}
+  .btn:hover{background:rgba(255,255,255,.12)}
+  .cam-meta{display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-top:8px}
+  .cam-meta .credit{font-size:13px}
+  .cam-meta .credit span{color:var(--muted)}
+  .cam-note{font-size:12px; color:var(--muted); margin:6px 0 0; line-height:1.5}
+
+  /* hazards */
+  .hazards{display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:12px; margin:8px 0 24px}
+  .hz{border-radius:var(--radius); padding:15px 17px; border:1px solid transparent}
+  .hz .hz-top{display:flex; align-items:center; gap:7px; font-size:13px; font-weight:600}
+  .hz .lvl{font-size:24px; font-weight:600; margin:5px 0 0; letter-spacing:-.01em}
+  .hz .det{font-size:12px; margin:5px 0 0}
+  .hz.amber{background:var(--amber-bg); border-color:#f0dcae; color:var(--amber-ink)}
+  .hz.red{background:var(--red-bg); border-color:#f0c4c0; color:var(--red-ink)}
+  .hz.green{background:var(--green-bg); border-color:#cfe2b6; color:var(--green-ink)}
+
+  /* tide */
+  .chartbox{padding:16px 16px 12px; margin-bottom:24px}
+  .chart-wrap{position:relative; width:100%; height:170px}
+  .tide-caption{font-size:12px; color:var(--muted); margin:8px 2px 0}
+
+  /* conditions */
+  .cond{display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:24px}
+  .metric{background:var(--surface); border:1px solid var(--border); border-radius:11px; padding:13px 14px}
+  .metric .k{font-size:12px; color:var(--muted); margin:0}
+  .metric .v{font-size:21px; font-weight:600; margin:4px 0 0}
+
+  /* footer */
+  .chips{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px}
+  .chip{font-size:12px; border-radius:9px; padding:5px 11px; border:1px solid var(--border); background:var(--surface); color:var(--muted)}
+  .chip .ic{font-weight:700; margin-right:5px}
+  .chip.ok .ic{color:var(--ok)} .chip.warn{background:#fff7e6; border-color:#f0d999; color:#7c5807}
+  .chip.warn .ic{color:var(--warn)} .chip.down{background:var(--red-bg); border-color:#f0c4c0; color:var(--red-ink)}
+  .disclaimer{font-size:12px; color:var(--muted); line-height:1.6; margin:0 0 10px}
+  .safety{font-size:12px; color:var(--ink); line-height:1.6; margin:0; padding:11px 13px; background:var(--surface);
+    border:1px solid var(--border); border-radius:11px}
+  .safety b{font-weight:600}
+  .hr{height:1px; background:var(--border); border:0; margin:0 0 16px}
+</style>
+</head>
+<body>
+<main class="wrap">
+
+  <div class="top">
+    <div>
+      <h1>Seaview Pier &middot; New River Inlet end</h1>
+      <p class="sub">North Topsail Beach, NC &middot; zone NCZ199 &middot; NWS Morehead City</p>
+    </div>
+    <div class="stamp"><span id="stamp-time">&mdash;</span><button id="refresh" type="button">Refresh</button></div>
+  </div>
+
+  <div class="banner" id="banner">
+    <span aria-hidden="true">&#9888;</span>
+    <span>Sample data — not live. Set a data source before relying on this.</span>
+  </div>
+
+  <p class="section-label">Live view</p>
+  <div class="frame">
+    <span class="pill" id="pill"><span class="dot"></span>Live</span>
+    <video id="cam" muted autoplay playsinline controls preload="auto"></video>
+    <div class="loading" id="loading"><div class="spin" aria-label="Loading live view"></div></div>
+    <div class="fallback" id="fallback">
+      <p id="fallback-msg">Live view isn't available right now.</p>
+      <a class="btn" id="fallback-link" href="#" target="_blank" rel="noopener">Open live cam on SurfChex</a>
+    </div>
+  </div>
+  <div class="cam-meta">
+    <span class="credit">Seaview Pier <span>&middot; live surf cam</span></span>
+    <a id="source-link" href="#" target="_blank" rel="noopener">via SurfChex &rarr;</a>
+  </div>
+  <p class="cam-note">Live view for situational awareness — not a warning and not an automated detector. Conditions can be dangerous even when the water looks calm.</p>
+
+  <div class="hazards" id="hazards"></div>
+
+  <div class="card chartbox">
+    <p class="section-label">Tide — today &middot; shaded = outgoing (ebb), strongest inlet pull</p>
+    <div class="chart-wrap">
+      <canvas id="tide" role="img" aria-label="Tide curve for today with outgoing-tide windows shaded and a marker at the current time.">Tide curve for today.</canvas>
+    </div>
+    <p class="tide-caption" id="tide-caption">&mdash;</p>
+  </div>
+
+  <p class="section-label">Conditions</p>
+  <div class="cond" id="cond"></div>
+
+  <hr class="hr">
+  <div class="chips" id="chips"></div>
+  <p class="disclaimer">
+    Rip risk and tide are forecast and observation guidance. The inlet-current level is inferred from tide stage,
+    not a measured current, and does not account for wind-against-tide or river discharge that can make it worse.
+    None of this replaces on-site lifeguard flags or posted warnings.
+    <a href="https://www.weather.gov/beach/mhx" target="_blank" rel="noopener">Official NWS beach forecast &rarr;</a>
+  </p>
+  <p class="safety"><b>Caught in a current?</b> Don't fight it — stay calm, float, and signal for help. From shore, call 911 and throw something that floats; don't swim out after someone.</p>
+
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+(function(){
+  "use strict";
+
+  var CONFIG = {
+    dataEndpoint: "/conditions",              // same-origin when served by server.js; "" => sample only
+    refreshMs: 5 * 60 * 1000,
+    cam: {
+      streamUrl: "https://www.surfchex.com/hls/svfp/index.m3u8",
+      fallbackPage: "https://www.surfchex.com/cams/seaview-pier-north-topsail-beach/"
+    }
+  };
+
+  /* ---------- sample data (today, hourly tide) ---------- */
+  function sampleData(){
+    var base = new Date(); base.setSeconds(0,0);
+    function at(h,m){ var d=new Date(base); d.setHours(h,m||0,0,0); return d.toISOString(); }
+    var heights = [2.6,3.3,3.7,3.5,3.0,2.3,1.5,0.8,0.3,0.5,1.2,2.0,2.8,3.4,3.7];
+    var series = heights.map(function(h,i){ return { t: at(6+i), h: h }; });
+    return {
+      updated: new Date().toISOString(),
+      rip: { level:"Moderate", prob:45 },
+      conditions: { surf:"3-4 ft", period:"8 s", wind:"SW 12", water:"78\u00B0F" },
+      tide: { datum:"MLLW", series: series },
+      sources: [
+        { name:"Cam", status:"ok", detail:"live" },
+        { name:"Rip risk \u00B7 NWS SRF", status:"ok", detail:"4:00 AM" },
+        { name:"Tide \u00B7 CO-OPS", status:"ok", detail:"6 min ago" },
+        { name:"Buoy 41109 offline \u2014 using 41159", status:"warn", detail:"38 min" }
+      ],
+      _sample: true
+    };
+  }
+
+  /* ---------- inlet current, computed from tide stage ---------- */
+  function inletFromTide(series, now){
+    var pts = series.map(function(p){ return { t:new Date(p.t).getTime(), h:p.h }; })
+                    .sort(function(a,b){ return a.t-b.t; });
+    var t = now.getTime();
+    if (pts.length < 2) return { level:"Unknown", cls:"green", text:"Tide data unavailable" };
+    if (t <= pts[0].t) t = pts[0].t + 1;
+    if (t >= pts[pts.length-1].t) t = pts[pts.length-1].t - 1;
+
+    var i = 0;
+    for (var k=0; k<pts.length-1; k++){ if (t >= pts[k].t && t <= pts[k+1].t){ i=k; break; } }
+    var dtHr = (pts[i+1].t - pts[i].t) / 3600000;
+    var slope = (pts[i+1].h - pts[i].h) / dtHr;     // ft per hour, signed
+    var mag = Math.abs(slope);
+    var falling = slope < 0;
+
+    var level, cls, dir;
+    if (mag < 0.30){ level="Slack"; cls="green"; dir="near slack water"; }
+    else if (mag < 0.80){ level = falling ? "Moderate" : "Moderate"; cls="amber"; dir = falling ? "outgoing (ebb)" : "incoming (flood)"; }
+    else { level = falling ? "Strong" : "Building"; cls = falling ? "red" : "amber"; dir = falling ? "outgoing (ebb)" : "incoming (flood)"; }
+
+    var ext = nextExtreme(pts, t);
+    var extTxt = ext ? (ext.kind + " " + fmtTime(new Date(ext.t))) : "";
+    var detail = dir + (extTxt ? (" \u00B7 next " + extTxt) : "") + " \u00B7 independent of rip forecast";
+    return { level:level, cls:cls, text:detail };
+  }
+
+  function nextExtreme(pts, t){
+    for (var i=1; i<pts.length-1; i++){
+      if (pts[i].t <= t) continue;
+      var isMin = pts[i].h < pts[i-1].h && pts[i].h <= pts[i+1].h;
+      var isMax = pts[i].h > pts[i-1].h && pts[i].h >= pts[i+1].h;
+      if (isMin) return { kind:"low", t:pts[i].t };
+      if (isMax) return { kind:"high", t:pts[i].t };
+    }
+    return null;
+  }
+
+  function fmtTime(d){
+    var h=d.getHours(), m=d.getMinutes(), ap=h<12?"AM":"PM";
+    h=h%12; if(h===0)h=12;
+    return h + (m? (":"+(m<10?"0":"")+m):"") + " " + ap;
+  }
+
+  /* ---------- render ---------- */
+  function render(data){
+    document.getElementById("banner").classList.toggle("show", !!data._sample);
+    document.getElementById("stamp-time").textContent = "Updated " + fmtTime(new Date(data.updated));
+
+    var now = new Date();
+    var inlet = inletFromTide(data.tide.series, now);
+
+    var hz = document.getElementById("hazards");
+    hz.innerHTML = "";
+    hz.appendChild(hazardCard("\uD83C\uDF0A", "Surf-zone rip current", ripCls(data.rip.level), data.rip.level,
+      (data.rip.prob != null ? "Model " + Math.round(data.rip.prob) + "% \u00B7 " : "") + "possible in the breakers near the pier"));
+    hz.appendChild(hazardCard("\u2193", "Inlet tidal current", inlet.cls, inlet.level, inlet.text));
+
+    var c = data.conditions, cond = document.getElementById("cond");
+    cond.innerHTML = "";
+    cond.appendChild(metric("Surf height", c.surf));
+    cond.appendChild(metric("Wave period", c.period));
+    cond.appendChild(metric("Wind", c.wind));
+    cond.appendChild(metric("Water temp", c.water));
+
+    var chips = document.getElementById("chips"); chips.innerHTML = "";
+    (data.sources||[]).forEach(function(s){
+      var div=document.createElement("div");
+      div.className="chip " + (s.status||"ok");
+      var mark = s.status==="ok" ? "\u2713" : (s.status==="down" ? "\u2715" : "\u26A0");
+      div.innerHTML = '<span class="ic">'+mark+'</span>'+escapeHtml(s.name)+(s.detail? (" \u00B7 "+escapeHtml(s.detail)) : "");
+      chips.appendChild(div);
+    });
+
+    drawTide(data.tide.series, now);
+    var ext = nextExtreme(data.tide.series.map(function(p){return {t:new Date(p.t).getTime(),h:p.h};}), now.getTime());
+    document.getElementById("tide-caption").textContent =
+      "Datum " + (data.tide.datum||"MLLW") + (ext ? (" \u00B7 next " + ext.kind + " around " + fmtTime(new Date(ext.t))) : "");
+  }
+
+  function ripCls(level){
+    var l=(level||"").toLowerCase();
+    if (l.indexOf("high")>-1) return "red";
+    if (l.indexOf("mod")>-1) return "amber";
+    return "green";
+  }
+  function hazardCard(icon, label, cls, level, detail){
+    var d=document.createElement("div");
+    d.className="hz "+cls;
+    d.innerHTML = '<div class="hz-top"><span aria-hidden="true">'+icon+'</span>'+escapeHtml(label)+'</div>'+
+                  '<div class="lvl">'+escapeHtml(level)+'</div>'+
+                  '<div class="det">'+escapeHtml(detail)+'</div>';
+    return d;
+  }
+  function metric(k,v){
+    var d=document.createElement("div"); d.className="metric";
+    d.innerHTML='<p class="k">'+escapeHtml(k)+'</p><p class="v">'+escapeHtml(v)+'</p>';
+    return d;
+  }
+  function escapeHtml(s){ return String(s).replace(/[&<>"]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c];}); }
+
+  /* ---------- tide chart ---------- */
+  var chart=null;
+  function drawTide(series, now){
+    var labels = series.map(function(p){ return fmtTime(new Date(p.t)); });
+    var data = series.map(function(p){ return p.h; });
+    var times = series.map(function(p){ return new Date(p.t).getTime(); });
+
+    var ebbBand = {
+      id:"ebbBand",
+      beforeDatasetsDraw:function(ch){
+        var ctx=ch.ctx, area=ch.chartArea, x=ch.scales.x;
+        ctx.save();
+        for (var i=0;i<data.length-1;i++){
+          if (data[i+1] < data[i]){
+            var x1=x.getPixelForValue(i), x2=x.getPixelForValue(i+1);
+            ctx.fillStyle="rgba(216,69,60,0.10)";
+            ctx.fillRect(x1, area.top, x2-x1, area.bottom-area.top);
+          }
+        }
+        var tn=now.getTime();
+        if (tn>=times[0] && tn<=times[times.length-1]){
+          var j=0; for (var k=0;k<times.length-1;k++){ if(tn>=times[k]&&tn<=times[k+1]){j=k;break;} }
+          var frac=(tn-times[j])/(times[j+1]-times[j]);
+          var px=x.getPixelForValue(j)+(x.getPixelForValue(j+1)-x.getPixelForValue(j))*frac;
+          ctx.strokeStyle="rgba(90,100,107,0.85)"; ctx.lineWidth=1.5; ctx.setLineDash([4,3]);
+          ctx.beginPath(); ctx.moveTo(px,area.top); ctx.lineTo(px,area.bottom); ctx.stroke();
+          ctx.setLineDash([]); ctx.fillStyle="rgba(90,100,107,0.95)"; ctx.font="11px sans-serif"; ctx.textAlign="center";
+          ctx.fillText("now", px, area.top+11);
+        }
+        ctx.restore();
+      }
+    };
+
+    if (chart) chart.destroy();
+    chart = new Chart(document.getElementById("tide"), {
+      type:"line",
+      data:{ labels:labels, datasets:[{ data:data, borderColor:"#2b86c4",
+        backgroundColor:"rgba(43,134,196,0.08)", fill:true, tension:0.4, pointRadius:0, borderWidth:2 }] },
+      plugins:[ebbBand],
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label:function(c){ return c.parsed.y.toFixed(1)+" ft"; } } } },
+        scales:{
+          y:{ beginAtZero:true, ticks:{ callback:function(v){return v+" ft";}, font:{size:11} }, grid:{ color:"rgba(90,100,107,0.12)" } },
+          x:{ ticks:{ autoSkip:true, maxRotation:0, font:{size:11} }, grid:{ display:false } }
+        }
+      }
+    });
+  }
+
+  /* ---------- data loading ---------- */
+  function loadData(){
+    if (!CONFIG.dataEndpoint){ render(sampleData()); return; }
+    fetch(CONFIG.dataEndpoint, { cache:"no-store" })
+      .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+      .then(function(d){ d._sample=false; render(d); })
+      .catch(function(){
+        var s=sampleData(); render(s);
+        var b=document.getElementById("banner");
+        b.classList.add("show");
+        b.lastElementChild.textContent="Couldn't reach the data source — showing sample data.";
+      });
+  }
+
+  /* ---------- cam ---------- */
+  function initCam(){
+    var v=document.getElementById("cam"), pill=document.getElementById("pill"),
+        loading=document.getElementById("loading"), fb=document.getElementById("fallback"),
+        msg=document.getElementById("fallback-msg");
+    document.getElementById("fallback-link").href=CONFIG.cam.fallbackPage;
+    document.getElementById("source-link").href=CONFIG.cam.fallbackPage;
+    var settled=false;
+    function live(){ if(settled)return; settled=true; loading.classList.add("hide"); pill.classList.add("is-live"); }
+    function fail(m){ if(settled)return; settled=true; loading.classList.add("hide"); if(m)msg.textContent=m; fb.classList.add("show"); }
+    if (!CONFIG.cam.streamUrl){ fail("Open the live cam on SurfChex."); return; }
+    v.addEventListener("playing", live);
+    if (v.canPlayType("application/vnd.apple.mpegurl")){
+      v.src=CONFIG.cam.streamUrl;
+      v.addEventListener("error", function(){ fail("Live view couldn't load. Open it on SurfChex."); });
+    } else if (window.Hls && window.Hls.isSupported()){
+      var hls=new window.Hls({ lowLatencyMode:true, liveSyncDurationCount:3 });
+      hls.loadSource(CONFIG.cam.streamUrl); hls.attachMedia(v);
+      hls.on(window.Hls.Events.ERROR, function(e,d){ if(d&&d.fatal) fail("Live view couldn't load here (often a cross-origin block). Open it on SurfChex."); });
+    } else {
+      fail("This browser can\u2019t play the stream. Open it on SurfChex.");
+    }
+    setTimeout(function(){ fail("Live view is taking too long. Open it on SurfChex."); }, 12000);
+  }
+
+  document.getElementById("refresh").addEventListener("click", loadData);
+  initCam();
+  loadData();
+  setInterval(loadData, CONFIG.refreshMs);
+})();
+</script>
+</body>
+</html>
