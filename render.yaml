@@ -1,0 +1,13 @@
+# Render Blueprint — deploy this repo as a free Node web service.
+# In Render: New + -> Blueprint -> connect this GitHub repo. Render reads this
+# file, builds, and gives you a public URL like https://current-danger.onrender.com
+services:
+  - type: web
+    name: current-danger
+    runtime: node
+    plan: free
+    region: ohio              # closest US-East region to NC
+    buildCommand: npm install # no dependencies, but Render expects the step
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true          # redeploy on every push to the default branch

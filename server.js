@@ -36,7 +36,7 @@ try { ripModel = require("./rip-model"); } catch (_) { /* module absent */ }
 
 const CONFIG = {
   host: "0.0.0.0",
-  port: 8787,
+  port: Number(process.env.PORT) || 8787,   // cloud hosts inject PORT; 8787 locally
   allowOrigin: "*",                 // tighten to your site's origin in production
   refreshMs: 5 * 60 * 1000,
   fetchTimeoutMs: 10000,
@@ -305,13 +305,15 @@ const server = http.createServer((req, res) => {
   return serveStatic(res, path);
 });
 
-(async function start() {
-  try { await refresh(); }
-  catch (e) { console.error("initial refresh failed:", e.message); }
-  setInterval(() => refresh().catch(e => console.error("refresh error:", e.message)), CONFIG.refreshMs);
+(function start() {
+  // Open the port immediately so cloud health checks pass and the page loads
+  // right away; the first data refresh (incl. the 52 MB GRIB) runs in the
+  // background. /conditions returns 503 "warming up" until it completes.
   server.listen(CONFIG.port, CONFIG.host, () => {
     console.log("current_danger running:");
     console.log("  dashboard  http://localhost:" + CONFIG.port + "/");
     console.log("  data       http://localhost:" + CONFIG.port + "/conditions");
+    refresh().catch(e => console.error("initial refresh failed:", e.message));
+    setInterval(() => refresh().catch(e => console.error("refresh error:", e.message)), CONFIG.refreshMs);
   });
 })();

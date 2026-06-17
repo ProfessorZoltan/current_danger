@@ -371,16 +371,25 @@
   }
 
   /* ---------- data loading ---------- */
+  var warmupTries=0;
   function loadData(){
     if (!CONFIG.dataEndpoint){ render(sampleData()); return; }
     fetch(CONFIG.dataEndpoint, { cache:"no-store" })
       .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
-      .then(function(d){ d._sample=false; render(d); })
+      .then(function(d){ warmupTries=0; d._sample=false; render(d); })
       .catch(function(){
         var s=sampleData(); render(s);
         var b=document.getElementById("banner");
         b.classList.add("show");
-        b.lastElementChild.textContent="Couldn't reach the data source — showing sample data.";
+        // A freshly-woken host is still warming up; retry quickly a few times
+        // before settling into the normal refresh cadence.
+        if (warmupTries < 6){
+          warmupTries++;
+          b.lastElementChild.textContent="Loading live conditions… (showing sample data)";
+          setTimeout(loadData, 8000);
+        } else {
+          b.lastElementChild.textContent="Couldn't reach the data source — showing sample data.";
+        }
       });
   }
 

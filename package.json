@@ -1,0 +1,13 @@
+{
+  "name": "current-danger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "North Topsail Island / Seaview Pier current-danger dashboard — live rip-current, surf, wind, and tide conditions aggregated from NOAA/NWS sources.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
