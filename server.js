@@ -194,15 +194,126 @@ async function fetchRipModelProb() {
 }
 
 /* ------------------------------------------------------------------ */
+/* swim-safety windows (derived from the NWPS hourly model series)    */
+/* ------------------------------------------------------------------ */
+
+const SWIM = {
+  bands: [                                                       // score -> relative risk
+    { key: "lower",    label: "Lower risk",    max: 34 },
+    { key: "moderate", label: "Moderate risk", max: 67 },
+    { key: "higher",   label: "Higher risk",   max: Infinity }
+  ],
+  horizonH: 48,      // hourly strip length
+  windowDays: 4,     // search this far ahead for best windows
+  maxWindows: 5
+};
+
+// Sun altitude (degrees above horizon) at a UTC instant — robust at all hours,
+// no day-boundary issues. Daylight when the sun is above the standard -0.833°.
+function sunAltitudeDeg(ms, lat, lon) {
+  const rad = Math.PI / 180;
+  const dDays = ms / 86400000 - 10957.5;                 // days since 2000-01-01T12:00Z
+  const g = (357.529 + 0.98560028 * dDays) % 360;        // mean anomaly
+  const q = (280.459 + 0.98564736 * dDays) % 360;        // mean longitude
+  const L = (q + 1.915 * Math.sin(g * rad) + 0.020 * Math.sin(2 * g * rad)) % 360;  // ecliptic lon
+  const e = 23.439 - 0.00000036 * dDays;                 // obliquity
+  const RA = Math.atan2(Math.cos(e * rad) * Math.sin(L * rad), Math.cos(L * rad));
+  const dec = Math.asin(Math.sin(e * rad) * Math.sin(L * rad));
+  const GMST = (280.46061837 + 360.98564736629 * dDays) % 360;
+  const ha = (GMST + lon) * rad - RA;                    // local hour angle
+  const alt = Math.asin(Math.sin(lat * rad) * Math.sin(dec) + Math.cos(lat * rad) * Math.cos(dec) * Math.cos(ha));
+  return alt / rad;
+}
+function isDaylight(ms, lat, lon) { return sunAltitudeDeg(ms, lat, lon) > -0.833; }
+
+const clamp = (x, lo, hi) => (x < lo ? lo : x > hi ? hi : x);
+// Rip-current probability (%) is the spine of the score; surf, wind, and
+// nearshore current are additive bumps that can only raise the risk. This lets
+// a high rip probability reach the top band on its own, as it should.
+function swimScore(h) {
+  let s = h.ripPct || 0;
+  if (h.waveFt != null) s += clamp((h.waveFt - 2) * 5, 0, 20);   // surf:  2 ft -> 0, 6 ft -> +20
+  if (h.windKt != null) s += clamp((h.windKt - 12) * 1, 0, 10);  // wind:  12 kt -> 0, 22 kt -> +10
+  if (h.currKt != null) s += clamp((h.currKt - 1) * 10, 0, 15);  // curr:  1 kt -> 0, 2.5 kt -> +15
+  return Math.round(clamp(s, 0, 100));
+}
+function swimBand(score) { return SWIM.bands.find(b => score < b.max) || SWIM.bands[2]; }
+function swimReason(h) {
+  const p = [];
+  if (h.ripPct != null) p.push((h.ripPct >= 50 ? "high" : h.ripPct >= 25 ? "moderate" : "low") + " rip " + Math.round(h.ripPct) + "%");
+  if (h.waveFt != null) p.push(Math.round(h.waveFt) + " ft surf");
+  if (h.windKt != null && h.windKt >= 15) p.push(Math.round(h.windKt) + " kt wind");
+  if (h.currKt != null && h.currKt >= 1) p.push("strong current");
+  return p.join(" · ");
+}
+
+const SWIM_NOTE = "Relative risk from the NWPS model (rip, surf, wind, nearshore current) at " +
+  "Seaview Pier, daylight hours only. Planning guidance — not a guarantee. Excludes " +
+  "thunderstorms/lightning and water quality. Never swim alone; always heed posted flags and signs.";
+
+function buildSwim(series) {
+  if (!series || !series.hours || !series.hours.length || !ripModel) return null;
+  const now = Date.now();
+  const lat = ripModel.CFG.point.lat, lon = ripModel.CFG.point.lon;
+
+  const scored = series.hours.map(h => {
+    const score = swimScore(h);
+    return {
+      valid: h.valid, score, band: swimBand(score).key, day: isDaylight(h.valid, lat, lon),
+      rip: h.ripPct == null ? null : Math.round(h.ripPct),
+      waveFt: h.waveFt == null ? null : Math.round(h.waveFt * 10) / 10,
+      windKt: h.windKt == null ? null : Math.round(h.windKt),
+      reason: swimReason(h)
+    };
+  });
+
+  const horizonEnd = now + SWIM.horizonH * 3600000;
+  const hourly = scored
+    .filter(h => h.valid >= now - 3600000 && h.valid <= horizonEnd)
+    .map(h => ({ t: new Date(h.valid).toISOString(), score: h.score, band: h.band, day: h.day, rip: h.rip, waveFt: h.waveFt, windKt: h.windKt }));
+
+  // Contiguous daylight runs of one band, within the search horizon.
+  const limit = now + SWIM.windowDays * 86400000;
+  const segs = [];
+  let cur = null;
+  for (const h of scored) {
+    if (h.valid < now || h.valid > limit) continue;
+    if (!h.day) { cur = null; continue; }                       // never span a night
+    if (cur && cur.band === h.band) {
+      cur.end = h.valid; cur.minScore = Math.min(cur.minScore, h.score);
+      if (h.score >= cur.worst) { cur.worst = h.score; cur.reason = h.reason; }
+    } else {
+      cur = { start: h.valid, end: h.valid, band: h.band, label: swimBand(h.score).label, minScore: h.score, worst: h.score, reason: h.reason };
+      segs.push(cur);
+    }
+  }
+  // Prefer windows of at least 2 hours; fall back to all if fragmented.
+  let cand = segs.filter(s => s.end > s.start);
+  if (!cand.length) cand = segs;
+  // Surface the genuinely safest upcoming stretches: lowest min-score first.
+  const windows = cand.slice().sort((a, b) => a.minScore - b.minScore)
+    .slice(0, SWIM.maxWindows)
+    .sort((a, b) => a.start - b.start)
+    .map(s => ({ start: new Date(s.start).toISOString(), end: new Date(s.end + 3600000).toISOString(), band: s.band, label: s.label, score: s.minScore, reason: s.reason }));
+
+  return { generated: new Date(series.runValid || now).toISOString(), windows, hourly, note: SWIM_NOTE };
+}
+
+async function fetchSwim() {
+  if (!ripModel || !ripModel.getSwimSeries) return null;
+  return buildSwim(await ripModel.getSwimSeries());
+}
+
+/* ------------------------------------------------------------------ */
 /* aggregate (with per-source last-good cache)                        */
 /* ------------------------------------------------------------------ */
 
-const lastGood = { srf: null, buoy: null, tide: null };
+const lastGood = { srf: null, buoy: null, tide: null, swim: null };
 let cache = null;
 
 async function refresh() {
-  const [srfR, buoyR, tideR, camStatus, ripProb] = await Promise.allSettled([
-    fetchSurfZoneForecast(), fetchBuoy(), fetchTides(), fetchCamStatus(), fetchRipModelProb()
+  const [srfR, buoyR, tideR, camStatus, ripProb, swimR] = await Promise.allSettled([
+    fetchSurfZoneForecast(), fetchBuoy(), fetchTides(), fetchCamStatus(), fetchRipModelProb(), fetchSwim()
   ]);
 
   const sources = [];
@@ -243,6 +354,15 @@ async function refresh() {
   // wind source label
   sources.push({ name: "Wind \u00B7 NWS forecast", status: srf ? "ok" : "down", detail: srf ? "zone NCZ199" : "unavailable" });
 
+  // swim windows (NWPS model series)
+  let swim = lastGood.swim;
+  if (swimR.status === "fulfilled" && swimR.value) {
+    swim = swimR.value; lastGood.swim = swim;
+    sources.push({ name: "Swim windows \u00B7 NWPS model", status: "ok", detail: swim.windows.length + " window" + (swim.windows.length === 1 ? "" : "s") + " ahead" });
+  } else {
+    sources.push({ name: "Swim windows \u00B7 NWPS model", status: swim ? "warn" : "down", detail: swim ? "using last good" : "no model run" });
+  }
+
   const json = {
     updated: new Date().toISOString(),
     rip: {
@@ -256,6 +376,7 @@ async function refresh() {
       water: (buoy && buoy.water) || "—"
     },
     tide: tide || { datum: "MLLW", station: CONFIG.tideStationName, series: [] },
+    swim: swim || null,
     sources
   };
 

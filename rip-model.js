@@ -257,6 +257,76 @@ async function getRipProbability(opts) {
   return val;
 }
 
+/* ---------- multi-field hourly series (for swim-safety scoring) -------- */
+
+// Every field is at the same 145 hourly steps and same grid point; decode each
+// at our cell and key by valid time. Units converted to the dashboard's.
+const SWIM_FIELDS = {
+  ripPct:  { discipline: 10, category: 1, number: 4 },   // RIPCOP, %
+  waveM:   { discipline: 10, category: 0, number: 3 },   // HTSGW, m
+  periodS: { discipline: 10, category: 0, number: 11 },  // PERPW, s
+  windMs:  { discipline: 0,  category: 2, number: 1 },   // WIND,  m/s
+  currMs:  { discipline: 10, category: 1, number: 1 }    // SPC,   m/s (current speed)
+};
+
+// Like decodePoint, but if the exact cell is masked (our point sits at the
+// shoreline/pier and the wave fields mark it as land), spiral outward to the
+// nearest valid water cell. Keeps near-shore fields where swimmers actually are.
+function decodeNearest(buf, m, lon, lat, maxRing) {
+  const v0 = decodePoint(buf, m, lon, lat);
+  if (v0 != null) return v0;
+  if (!m.grid) return null;
+  const di = m.grid.di, dj = m.grid.dj, R = maxRing || 4;
+  for (let r = 1; r <= R; r++) {
+    let best = null, bestD = Infinity;
+    for (let a = -r; a <= r; a++) for (let b = -r; b <= r; b++) {
+      if (Math.max(Math.abs(a), Math.abs(b)) !== r) continue;   // current ring only
+      const v = decodePoint(buf, m, lon + a * di, lat + b * dj);
+      if (v != null) { const d = a * a + b * b; if (d < bestD) { bestD = d; best = v; } }
+    }
+    if (best != null) return best;
+  }
+  return null;
+}
+
+function seriesFor(buf, msgs, f) {
+  const map = new Map();
+  msgs.filter(m => m.discipline === f.discipline && m.category === f.category &&
+                   m.number === f.number && m.valid != null)
+      .forEach(m => {
+        const v = decodeNearest(buf, m, CFG.point.lon, CFG.point.lat);
+        if (v != null && isFinite(v) && v < 1e19) map.set(m.valid, v);
+      });
+  return map;
+}
+
+let swimCache = null;
+async function getSwimSeries() {
+  if (swimCache && (Date.now() - swimCache.ts) < CFG.cacheMs) return swimCache.val;
+  const run = await resolveRun(new Date());
+  if (!run) { swimCache = { val: null, ts: Date.now() }; return null; }
+  let buf;
+  try { buf = await downloadGrib(run); }
+  catch (e) { console.warn("[rip-model] swim series download failed: " + e.message);
+    swimCache = { val: null, ts: Date.now() }; return null; }
+
+  const msgs = parseMessages(buf);
+  const maps = {};
+  for (const k in SWIM_FIELDS) maps[k] = seriesFor(buf, msgs, SWIM_FIELDS[k]);
+  const valids = [...maps.ripPct.keys()].sort((a, b) => a - b);
+  const hours = valids.map(v => ({
+    valid:   v,
+    ripPct:  maps.ripPct.has(v)  ? maps.ripPct.get(v) : null,
+    waveFt:  maps.waveM.has(v)   ? maps.waveM.get(v) * 3.28084 : null,
+    periodS: maps.periodS.has(v) ? maps.periodS.get(v) : null,
+    windKt:  maps.windMs.has(v)  ? maps.windMs.get(v) * 1.94384 : null,
+    currKt:  maps.currMs.has(v)  ? maps.currMs.get(v) * 1.94384 : null
+  }));
+  const val = { runValid: hours.length ? hours[0].valid : null, hours };
+  swimCache = { val, ts: Date.now() };
+  return val;
+}
+
 /* ---------- discovery CLI ---------------------------------------------- */
 
 async function discover() {
@@ -289,7 +359,7 @@ async function discover() {
   }
 }
 
-module.exports = { getRipProbability, discover, CFG, parseMessages, decodePoint };
+module.exports = { getRipProbability, getSwimSeries, discover, CFG, parseMessages, decodePoint };
 
 if (require.main === module && process.argv.includes("--discover")) {
   discover().catch(e => console.error(e.message));

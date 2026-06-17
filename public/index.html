@@ -102,6 +102,28 @@
   .hz.red{background:var(--red-bg); border-color:#f0c4c0; color:var(--red-ink)}
   .hz.green{background:var(--green-bg); border-color:#cfe2b6; color:var(--green-ink)}
 
+  /* swim windows */
+  #swim-windows .swim-win{display:flex; align-items:center; gap:11px; padding:9px 11px; border-radius:10px; border:1px solid transparent; margin-bottom:7px}
+  .swim-win .sw-bar{width:4px; align-self:stretch; border-radius:3px; background:currentColor; opacity:.55}
+  .swim-win .sw-main{flex:1; min-width:0}
+  .swim-win .sw-time{font-size:14px; font-weight:600}
+  .swim-win .sw-reason{font-size:12px; opacity:.78; margin-top:1px}
+  .swim-win .sw-band{font-size:12px; font-weight:600; white-space:nowrap}
+  .swim-win.green{background:var(--green-bg); border-color:#cfe2b6; color:var(--green-ink)}
+  .swim-win.amber{background:var(--amber-bg); border-color:#f0dcae; color:var(--amber-ink)}
+  .swim-win.red{background:var(--red-bg); border-color:#f0c4c0; color:var(--red-ink)}
+  .swim-empty{font-size:13px; color:var(--muted); margin:0}
+  .swim-strip{display:flex; gap:1px; height:38px; border-radius:8px; overflow:hidden; margin-top:8px}
+  .sw-cell{flex:1 1 0; min-width:0}
+  .sw-cell.green{background:#5f8f24} .sw-cell.amber{background:#c98213} .sw-cell.red{background:#d8453c}
+  .sw-cell.night{opacity:.3}
+  .sw-cell.daybreak{box-shadow:inset 1px 0 0 rgba(255,255,255,.6)}
+  .swim-axis{display:flex; justify-content:space-between; font-size:11px; color:var(--muted); margin-top:4px}
+  .swim-legend{display:flex; gap:13px; font-size:11px; color:var(--muted); margin-top:9px; flex-wrap:wrap}
+  .swim-legend span{display:inline-flex; align-items:center; gap:5px}
+  .swim-legend i{width:10px; height:10px; border-radius:2px}
+  .swim-note{font-size:11px; color:var(--muted); margin:11px 0 0; line-height:1.45}
+
   /* tide */
   .chartbox{padding:16px 16px 12px; margin-bottom:24px}
   .chart-wrap{position:relative; width:100%; height:170px}
@@ -160,6 +182,21 @@
 
   <div class="hazards" id="hazards"></div>
 
+  <div class="card" id="swimbox">
+    <p class="section-label">Best swim windows &middot; daylight, next few days</p>
+    <div id="swim-windows"></div>
+    <p class="section-label" style="margin:16px 0 0">Risk by hour &middot; next 48 hours</p>
+    <div class="swim-strip" id="swim-strip"></div>
+    <div class="swim-axis"><span>now</span><span>+48h</span></div>
+    <div class="swim-legend">
+      <span><i style="background:#5f8f24"></i>Lower</span>
+      <span><i style="background:#c98213"></i>Moderate</span>
+      <span><i style="background:#d8453c"></i>Higher</span>
+      <span><i style="background:#5f8f24;opacity:.3"></i>Night</span>
+    </div>
+    <p class="swim-note" id="swim-note"></p>
+  </div>
+
   <div class="card chartbox">
     <p class="section-label">Tide — today &middot; shaded = outgoing (ebb), strongest inlet pull</p>
     <div class="chart-wrap">
@@ -209,10 +246,28 @@
       rip: { level:"Moderate", prob:45 },
       conditions: { surf:"3-4 ft", period:"8 s", wind:"SW 12", water:"78\u00B0F" },
       tide: { datum:"MLLW", series: series },
+      swim: (function(){
+        var bands=["lower","lower","moderate","higher"], hourly=[];
+        for(var i=0;i<48;i++){
+          var hr=(base.getHours()+i)%24, day=hr>=6&&hr<20;
+          hourly.push({ t: at(base.getHours()+i), score:20+(i%4)*18,
+            band: day?bands[i%4]:"moderate", day:day, rip:20+(i%5)*12, waveFt:2+(i%3), windKt:8 });
+        }
+        return {
+          generated: new Date().toISOString(),
+          windows: [
+            { start: at(7), end: at(11), band:"lower", label:"Lower risk", score:18, reason:"low rip 20% \u00B7 2 ft surf" },
+            { start: at(17), end: at(20), band:"moderate", label:"Moderate risk", score:46, reason:"moderate rip 46% \u00B7 3 ft surf" }
+          ],
+          hourly: hourly,
+          note: "Sample data. Relative risk from the NWPS model (rip, surf, wind, current), daylight only \u2014 not a guarantee. Never swim alone; heed posted flags and signs."
+        };
+      })(),
       sources: [
         { name:"Cam", status:"ok", detail:"live" },
         { name:"Rip risk \u00B7 NWS SRF", status:"ok", detail:"4:00 AM" },
         { name:"Tide \u00B7 CO-OPS", status:"ok", detail:"6 min ago" },
+        { name:"Swim windows \u00B7 NWPS model", status:"ok", detail:"2 windows ahead" },
         { name:"Buoy 41109 offline \u2014 using 41159", status:"warn", detail:"38 min" }
       ],
       _sample: true
@@ -277,6 +332,8 @@
       (data.rip.prob != null ? "Model " + Math.round(data.rip.prob) + "% \u00B7 " : "") + "possible in the breakers near the pier"));
     hz.appendChild(hazardCard("\u2193", "Inlet tidal current", inlet.cls, inlet.level, inlet.text));
 
+    renderSwim(data.swim);
+
     var c = data.conditions, cond = document.getElementById("cond");
     cond.innerHTML = "";
     cond.appendChild(metric("Surf height", c.surf));
@@ -298,6 +355,52 @@
     document.getElementById("tide-caption").textContent =
       (data.tide.station ? data.tide.station + " \u00B7 " : "") +
       "Datum " + (data.tide.datum||"MLLW") + (ext ? (" \u00B7 next " + ext.kind + " around " + fmtTime(new Date(ext.t))) : "");
+  }
+
+  /* ---------- swim windows ---------- */
+  function swimCls(band){ return band==="higher"?"red":band==="moderate"?"amber":"green"; }
+  function swimLabel(band){ return band==="higher"?"Higher risk":band==="moderate"?"Moderate risk":"Lower risk"; }
+  function dayLabel(d){
+    var t=new Date(); t.setHours(0,0,0,0);
+    var dd=new Date(d); dd.setHours(0,0,0,0);
+    var diff=Math.round((dd-t)/86400000);
+    if(diff===0) return "Today";
+    if(diff===1) return "Tomorrow";
+    return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][dd.getDay()];
+  }
+  function fmtRange(startISO,endISO){
+    var s=new Date(startISO), e=new Date(endISO);
+    return dayLabel(s)+" "+fmtTime(s)+"–"+fmtTime(e);
+  }
+  function renderSwim(swim){
+    var box=document.getElementById("swimbox");
+    if(!swim || !swim.windows){ box.style.display="none"; return; }
+    box.style.display="";
+
+    var wrap=document.getElementById("swim-windows"); wrap.innerHTML="";
+    if(!swim.windows.length){
+      wrap.innerHTML='<p class="swim-empty">No lower-risk daylight windows in the forecast period — conditions stay elevated. Watch posted flags.</p>';
+    } else {
+      swim.windows.forEach(function(w){
+        var row=document.createElement("div");
+        row.className="swim-win "+swimCls(w.band);
+        row.innerHTML='<span class="sw-bar"></span>'+
+          '<div class="sw-main"><div class="sw-time">'+escapeHtml(fmtRange(w.start,w.end))+'</div>'+
+          '<div class="sw-reason">'+escapeHtml(w.reason||"")+'</div></div>'+
+          '<span class="sw-band">'+escapeHtml(w.label||swimLabel(w.band))+'</span>';
+        wrap.appendChild(row);
+      });
+    }
+
+    var strip=document.getElementById("swim-strip"); strip.innerHTML="";
+    (swim.hourly||[]).forEach(function(h){
+      var d=new Date(h.t), cell=document.createElement("div");
+      cell.className="sw-cell "+swimCls(h.band)+(h.day?"":" night")+(d.getHours()===0?" daybreak":"");
+      cell.title=dayLabel(d)+" "+fmtTime(d)+" · "+swimLabel(h.band)+
+        (h.rip!=null?(" · rip "+h.rip+"%"):"")+(h.waveFt!=null?(" · "+h.waveFt+" ft"):"");
+      strip.appendChild(cell);
+    });
+    document.getElementById("swim-note").textContent = swim.note||"";
   }
 
   function ripCls(level){
